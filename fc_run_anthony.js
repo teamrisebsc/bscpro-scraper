@@ -65,7 +65,8 @@ const path = require('path');
 
 const DATA_DIR = path.join(__dirname, 'data');
 const OUT_FILE = path.join(DATA_DIR, 'fc_run_anthony_latest.json');
-const RECENT_WINDOW_DAYS = 1;       // pending/issued buckets only count records dated today (0) or yesterday (1) — dynamic, relative to NOW below.
+const windowArg = process.argv.find(a => a.startsWith('--window='));
+const RECENT_WINDOW_DAYS = windowArg ? parseInt(windowArg.split('=')[1], 10) : 1;  // pending/issued buckets only count records dated today (0) or yesterday (1) by default — dynamic, relative to NOW below. Override with --window=N for a one-off wider run.
 const ANTHONY_BSCPRO_LOGIN_AS_URL = 'https://bscpro.com/auth/login_as_authorized_user/3997';
 
 const NOW = new Date();
@@ -164,18 +165,41 @@ async function fetchProductionRecords(page, endDateStr) {
   }, endDateStr);
 }
 
+// Mapped-team multiplier: when a sub-team is mapped in from elsewhere, BSCpro
+// shows a small "75%" (or similar) badge next to the writing/split agents in
+// the production grid, and only that fraction of the record's points count.
+// Confirmed via raw record inspection (Moises Cabrera, 8/8/26 — same mechanism
+// applies to Anthony's records): agents[].multiplier = "0.75" on the
+// writing_agent/split_agent (0 on trainees), and BSCpro's own points_detail
+// transactions bake this in (base_amount = transaction_amount *
+// attribution_percentage/100). Per Brilynn's instruction, apply the writing
+// agent's multiplier to actual_point before computing the 40%/60% credit.
+function getMappedMultiplier(r) {
+  const agents = Array.isArray(r.agents) ? r.agents : [];
+  const writingAgent = agents.find(a => a.agent_type === 'writing_agent');
+  if (writingAgent && writingAgent.multiplier !== undefined && writingAgent.multiplier !== null) {
+    const m = parseFloat(writingAgent.multiplier);
+    if (!isNaN(m)) return m;
+  }
+  return 1;
+}
+
 function normalizeRecord(r) {
   const policyNum = (r.policy_hidden || '').trim();
   const isIssued = !!policyNum && r.pending_submission !== '1';
   const cb = (r.cb_date || '').trim();
   const hasChargeback = !!cb && cb !== '0000-00-00';
+  const rawPoints = parseFloat(r.actual_point || 0) || 0;
+  const mappedMultiplier = getMappedMultiplier(r);
   return {
     client: (r.client_name || '').trim(),
     product_name: r.product_name || '',
     product_description: r.product_description || '',
     note: (r.acc_notes && r.acc_notes.note) || '',
     product_type: detectProductType(r.product_name),
-    points: parseFloat(r.actual_point || 0) || 0,  // "Base Points" column (left of Advances) — whole-number
+    raw_points: rawPoints,
+    mapped_multiplier: mappedMultiplier,
+    points: +(rawPoints * mappedMultiplier).toFixed(2),  // "Base Points" column (left of Advances) — whole-number; reduced by mapped_multiplier when < 1 (mapped-in team)
     submitted_date: r.product_date || '',
     first_adv: r.first_adv || '',      // date the "first_adv" points_detail transaction paid — releases 40% of points
     paid_2_date: r.paid_2_date || '',  // date the "second_adv" points_detail transaction paid — releases the remaining 60%
@@ -211,6 +235,7 @@ function buildScopeReport(records, scopeLabel) {
     client: r.client, product: r.product_name, product_type: r.product_type,
     first_adv: r.first_adv, days_since_first_adv: r.days_since_first_adv,
     points: r.points, credit_40pct: +(r.points * 0.4).toFixed(2),
+    ...(r.mapped_multiplier < 1 ? { raw_points: r.raw_points, mapped_multiplier: r.mapped_multiplier } : {}),
   }));
 
   const withSecondAdvDays = eligible.map(r => ({
@@ -225,6 +250,7 @@ function buildScopeReport(records, scopeLabel) {
     client: r.client, product: r.product_name, product_type: r.product_type,
     paid_2_date: r.paid_2_date, days_since_paid_2: r.days_since_paid_2,
     points: r.points, credit_60pct: +(r.points * 0.6).toFixed(2),
+    ...(r.mapped_multiplier < 1 ? { raw_points: r.raw_points, mapped_multiplier: r.mapped_multiplier } : {}),
   }));
 
   const chargebackBucket = withMeta.filter(r => r.has_chargeback && r.cb_date.startsWith(MONTH_YM)).map(r => ({

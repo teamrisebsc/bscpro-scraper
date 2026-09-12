@@ -65,6 +65,14 @@ const path = require('path');
 
 const DATA_DIR = path.join(__dirname, 'data');
 const OUT_FILE = path.join(DATA_DIR, 'fc_run_anthony_latest.json');
+// See fc_run_jamie.js for the full rationale (added 9/12/26 per Brilynn):
+// issued-but-advance-not-posted-yet policies were getting $0 credit forever
+// under the old advance-date-only formula. This registry tracks which
+// policy_numbers have already been credited (100% on issuance, or the old
+// 40%/60% advance split as a fallback) so they're never counted twice, and
+// seeds a one-time backfill on first run so existing back-issued business
+// doesn't spike this week's number.
+const REGISTRY_FILE = path.join(DATA_DIR, 'fc_run_credited_policies_anthony.json');
 const windowArg = process.argv.find(a => a.startsWith('--window='));
 const RECENT_WINDOW_DAYS = windowArg ? parseInt(windowArg.split('=')[1], 10) : 1;  // pending/issued buckets only count records dated today (0) or yesterday (1) by default — dynamic, relative to NOW below. Override with --window=N for a one-off wider run.
 const ANTHONY_BSCPRO_LOGIN_AS_URL = 'https://bscpro.com/auth/login_as_authorized_user/3997';
@@ -210,7 +218,7 @@ function normalizeRecord(r) {
   };
 }
 
-function buildScopeReport(records, scopeLabel) {
+function buildScopeReport(records, scopeLabel, registry, isBackfillRun) {
   const withMeta = records.map(normalizeRecord).map(r => ({
     ...r,
     is_trial: isTrialApp(r),
@@ -221,9 +229,27 @@ function buildScopeReport(records, scopeLabel) {
   const excludedTrial = withMeta.filter(r => !r.has_chargeback && r.is_trial);
   const excludedAnnuityLiteral = withMeta.filter(r => !r.has_chargeback && !r.is_trial && r.is_annuity_literal);
   const excludedAnnuityProductLine = withMeta.filter(r => !r.has_chargeback && !r.is_trial && !r.is_annuity_literal && r.is_annuity_product_line);
-  const eligible = withMeta.filter(r => !r.has_chargeback && !r.is_trial && !r.is_annuity_literal && !r.is_annuity_product_line);
+  const eligibleAll = withMeta.filter(r => !r.has_chargeback && !r.is_trial && !r.is_annuity_literal && !r.is_annuity_product_line);
 
-  const withFirstAdvDays = eligible.map(r => ({
+  // ---- Registry gate: skip anything already credited in a prior run ----
+  const registryScope = registry[scopeLabel] || (registry[scopeLabel] = {});
+  const alreadyCreditedCount = eligibleAll.filter(r => r.policy_number && registryScope[r.policy_number]).length;
+  const eligible = eligibleAll.filter(r => !(r.policy_number && registryScope[r.policy_number]));
+
+  // ---- Issued 100% bucket: see fc_run_jamie.js for full rationale ----
+  const issuedFullCredit = isBackfillRun ? [] : eligible.filter(r => r.is_issued && r.policy_number);
+  const issuedFullCreditBucket = issuedFullCredit.map(r => ({
+    client: r.client, product: r.product_name, product_type: r.product_type,
+    policy_number: r.policy_number, points: r.points, credit_100pct: r.points,
+    ...(r.mapped_multiplier < 1 ? { raw_points: r.raw_points, mapped_multiplier: r.mapped_multiplier } : {}),
+  }));
+  const issuedFullCreditTotal = +issuedFullCreditBucket.reduce((s, r) => s + r.credit_100pct, 0).toFixed(2);
+
+  const backfillSeeded = isBackfillRun ? eligible.filter(r => r.is_issued && r.policy_number) : [];
+
+  const notYetIssuedPool = isBackfillRun ? eligible : eligible.filter(r => !(r.is_issued && r.policy_number));
+
+  const withFirstAdvDays = notYetIssuedPool.map(r => ({
     ...r,
     days_since_first_adv: parseMDY(r.first_adv) ? Math.floor((NOW - parseMDY(r.first_adv)) / 86400000) : null,
   }));
@@ -238,7 +264,7 @@ function buildScopeReport(records, scopeLabel) {
     ...(r.mapped_multiplier < 1 ? { raw_points: r.raw_points, mapped_multiplier: r.mapped_multiplier } : {}),
   }));
 
-  const withSecondAdvDays = eligible.map(r => ({
+  const withSecondAdvDays = notYetIssuedPool.map(r => ({
     ...r,
     days_since_paid_2: parseMDY(r.paid_2_date) ? Math.floor((NOW - parseMDY(r.paid_2_date)) / 86400000) : null,
   }));
@@ -261,11 +287,39 @@ function buildScopeReport(records, scopeLabel) {
   const issuedTotal = +issuedBucket.reduce((s, r) => s + r.credit_60pct, 0).toFixed(2);
   const chargebackTotal = +chargebackBucket.reduce((s, r) => s + r.points, 0).toFixed(2);
 
+  const nowIso = new Date().toISOString();
+  for (const r of issuedFullCredit) {
+    registryScope[r.policy_number] = { credited_at: nowIso, points: r.points, bucket: 'issued_100pct', client: r.client, scope: scopeLabel };
+  }
+  for (const r of backfillSeeded) {
+    registryScope[r.policy_number] = { credited_at: nowIso, points: 0, bucket: 'backfill_seed', client: r.client, scope: scopeLabel };
+  }
+  for (const r of pendingInWindow) {
+    if (r.policy_number) registryScope[r.policy_number] = { credited_at: nowIso, points: +(r.points * 0.4).toFixed(2), bucket: 'first_adv_40pct', client: r.client, scope: scopeLabel };
+  }
+  for (const r of issuedInWindow) {
+    if (!r.policy_number) continue;
+    const existing = registryScope[r.policy_number];
+    if (existing && existing.bucket === 'first_adv_40pct') {
+      existing.bucket = 'first_adv_40pct+second_adv_60pct';
+      existing.points = +(existing.points + r.points * 0.6).toFixed(2);
+    } else {
+      registryScope[r.policy_number] = { credited_at: nowIso, points: +(r.points * 0.6).toFixed(2), bucket: 'second_adv_60pct', client: r.client, scope: scopeLabel };
+    }
+  }
+
   const sample = (arr, n = 15) => arr.slice(0, n).map(r => ({ client: r.client, product: r.product_name || r.product }));
 
   return {
     scope: scopeLabel,
     total_records_in_scope: records.length,
+    already_credited_prior_run_count: alreadyCreditedCount,
+    issued_100pct: {
+      bucket: issuedFullCreditBucket, total_credit: issuedFullCreditTotal,
+      note: isBackfillRun
+        ? `BACKFILL RUN: registry didn't exist yet — ${backfillSeeded.length} currently-issued policies were seeded into the registry at 0 credit (not counted) so this methodology change doesn't dump historical business into one week's number. From next run forward, newly-issued policies will show here at full credit.`
+        : 'Policies with a policy number (is_issued) not previously seen in the registry — credited at 100% of points regardless of advance-transaction status, per Brilynn 9/12/26.',
+    },
     pending_40pct: {
       bucket: pendingBucket, total_credit: pendingTotal,
       excluded_trial_count: excludedTrial.length, excluded_trial_sample: sample(excludedTrial),
@@ -283,7 +337,7 @@ function buildScopeReport(records, scopeLabel) {
       excluded_outside_window_count: issuedOutsideWindow.length, excluded_outside_window_note: `paid_2_date not today/yesterday (window ${RECENT_WINDOW_DAYS}d) — not counted`,
     },
     chargebacks: { bucket: chargebackBucket, total: chargebackTotal },
-    bscpro_pending_delta: +(pendingTotal + issuedTotal - chargebackTotal).toFixed(2),
+    bscpro_pending_delta: +(pendingTotal + issuedTotal + issuedFullCreditTotal - chargebackTotal).toFixed(2),
   };
 }
 
@@ -394,6 +448,8 @@ async function fetchNetPointsCurrent(page) {
 
 (async () => {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  const isBackfillRun = !fs.existsSync(REGISTRY_FILE);
+  const registry = isBackfillRun ? {} : JSON.parse(fs.readFileSync(REGISTRY_FILE, 'utf8'));
   const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
   const bscPage = await browser.newPage();
   await bscPage.setViewportSize({ width: 1600, height: 900 });
@@ -402,6 +458,7 @@ async function fetchNetPointsCurrent(page) {
     generated_at: new Date().toISOString(),
     for_month: `${MON_SHORT} ${YEAR}`,
     mywfg_current_points: { status: 'not_attempted' },
+    registry_backfill_run: isBackfillRun,
     scopes: {},
   };
 
@@ -446,7 +503,7 @@ async function fetchNetPointsCurrent(page) {
       await setScope(bscPage, values);
       const records = await fetchProductionRecords(bscPage, todayStr);
       console.log(`  Records fetched: ${records.length}`);
-      report.scopes[label] = buildScopeReport(records, label);
+      report.scopes[label] = buildScopeReport(records, label, registry, isBackfillRun);
     }
 
     // --- Running Total = Current WFG (Net) Points + BSCpro Delta ---
@@ -463,13 +520,14 @@ async function fetchNetPointsCurrent(page) {
         base: +(mw.base + report.scopes.base.bscpro_pending_delta).toFixed(2),
         superbase: +(mw.superbase + superbaseDelta).toFixed(2),
         superbase_delta_breakdown: { base_scope_delta: report.scopes.base.bscpro_pending_delta, superbase_scope_delta: report.scopes.superbase.bscpro_pending_delta, combined: superbaseDelta },
-        formula: 'Running Total = Current WFG Net Points (mywfg, current in-progress month) + BSCpro Delta (1st-advance-paid-today/yesterday*40% + 2nd-advance-paid-today/yesterday*60% - chargebacks); superbase delta = base scope delta + superbase scope delta (assumes superbase scope is exclusive of base, not cumulative — verify record counts for Anthony)',
+        formula: 'Running Total = Current WFG Net Points (mywfg, current in-progress month) + BSCpro Delta (newly-issued policies not previously credited*100% + 1st-advance-paid-today/yesterday*40% + 2nd-advance-paid-today/yesterday*60% - chargebacks); superbase delta = base scope delta + superbase scope delta (assumes superbase scope is exclusive of base, not cumulative — verify record counts for Anthony)',
         flanking_note: 'Confirmed by Brilynn 2026-08-01: Anthony Augugliaro is not flanked by anyone. No flanking adjustment applied.',
       };
     } else {
       report.running_totals = { status: 'UNAVAILABLE', reason: 'mywfg_current_points did not succeed this run — see mywfg_current_points.reason above. Do not report a running total without a fresh Current WFG Points figure.' };
     }
 
+    fs.writeFileSync(REGISTRY_FILE, JSON.stringify(registry, null, 2));
     fs.writeFileSync(OUT_FILE, JSON.stringify(report, null, 2));
     console.log('\nSaved to', OUT_FILE);
     console.log('REPORT_COMPLETE');

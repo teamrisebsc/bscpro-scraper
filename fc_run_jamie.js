@@ -78,6 +78,8 @@ const OUT_FILE = path.join(DATA_DIR, 'fc_run_jamie_latest.json');
 const REGISTRY_FILE = path.join(DATA_DIR, 'fc_run_credited_policies_jamie.json');
 const windowArg = process.argv.find(a => a.startsWith('--window='));
 const RECENT_WINDOW_DAYS = windowArg ? parseInt(windowArg.split('=')[1], 10) : 1;  // pending/issued buckets only count records dated today (0) or yesterday (1) by default — dynamic, relative to NOW below. Override with --window=N for a one-off wider run (e.g. to catch a date that aged out of the normal 1-day window). SEE CAVEAT ABOVE
+const unseedDatesArg = process.argv.find(a => a.startsWith('--unseed-dates='));
+const UNSEED_DATES = unseedDatesArg ? unseedDatesArg.split('=')[1].split(',') : null;  // one-off recovery: MM/DD/YYYY,MM/DD/YYYY — see buildScopeReport
 
 const NOW = new Date();
 const YEAR = NOW.getFullYear();
@@ -230,6 +232,9 @@ function normalizeRecord(r) {
     mapped_multiplier: mappedMultiplier,
     points: +(rawPoints * mappedMultiplier).toFixed(2),  // "Base Points" column (left of Advances) — whole-number, unlike base_written_points which applies a per-agent attribution split and produces decimals; reduced by mapped_multiplier when < 1 (mapped-in team)
     submitted_date: r.product_date || '',
+    issued_date: r.issued_date || '',
+    given_to_agent_date: r.given_to_agent_date || '',
+    production_created_at_date: (r.production_created_at || '').split(' ')[0] || '',
     first_adv: r.first_adv || '',      // date the "first_adv" points_detail transaction paid — releases 40% of points
     paid_2_date: r.paid_2_date || '',  // date the "second_adv" points_detail transaction paid — releases the remaining 60%
     policy_number: policyNum,
@@ -239,7 +244,7 @@ function normalizeRecord(r) {
   };
 }
 
-function buildScopeReport(records, scopeLabel, registry, isBackfillRun) {
+function buildScopeReport(records, scopeLabel, registry, isBackfillRun, unseedDates) {
   const withMeta = records.map(normalizeRecord).map(r => ({
     ...r,
     is_trial: isTrialApp(r),
@@ -257,6 +262,28 @@ function buildScopeReport(records, scopeLabel, registry, isBackfillRun) {
 
   // ---- Registry gate: skip anything already credited in a prior run ----
   const registryScope = registry[scopeLabel] || (registry[scopeLabel] = {});
+
+  // ---- One-off recovery (--unseed-dates=MM/DD/YYYY,MM/DD/YYYY): the 9/12/26
+  // backfill seeded EVERY currently-issued policy at 0 credit to avoid a
+  // historical spike, but that also swallowed the specific 9/10-9/11 policies
+  // that should have gotten real credit in the 9/11 run this fix was written
+  // for. Un-seed (remove from registry) any backfill_seed entry whose
+  // submitted_date matches one of the given dates, so it flows through as a
+  // fresh issued_100pct credit in this same run — one-time use, not part of
+  // normal weekly operation.
+  let unseededCount = 0;
+  if (unseedDates && unseedDates.length) {
+    for (const r of eligibleAll) {
+      if (!r.policy_number) continue;
+      const entry = registryScope[r.policy_number];
+      const recordDateMatch = unseedDates.includes(r.issued_date) || unseedDates.includes(r.given_to_agent_date) || unseedDates.includes(r.production_created_at_date);
+      if (entry && entry.bucket === 'backfill_seed' && recordDateMatch) {
+        delete registryScope[r.policy_number];
+        unseededCount++;
+      }
+    }
+  }
+
   const alreadyCreditedCount = eligibleAll.filter(r => r.policy_number && registryScope[r.policy_number]).length;
   const eligible = eligibleAll.filter(r => !(r.policy_number && registryScope[r.policy_number]));
 
@@ -365,11 +392,14 @@ function buildScopeReport(records, scopeLabel, registry, isBackfillRun) {
     scope: scopeLabel,
     total_records_in_scope: records.length,
     already_credited_prior_run_count: alreadyCreditedCount,
+    unseeded_for_recovery_count: unseededCount,
     issued_100pct: {
       bucket: issuedFullCreditBucket, total_credit: issuedFullCreditTotal,
       note: isBackfillRun
         ? `BACKFILL RUN: registry didn't exist yet — ${backfillSeeded.length} currently-issued policies were seeded into the registry at 0 credit (not counted) so this methodology change doesn't dump historical business into one week's number. From next run forward, newly-issued policies will show here at full credit.`
-        : 'Policies with a policy number (is_issued) not previously seen in the registry — credited at 100% of points regardless of advance-transaction status, per Brilynn 9/12/26.',
+        : unseededCount > 0
+          ? `Includes ${unseededCount} policy(ies) recovered via --unseed-dates (submitted_date matched one of the given recovery dates, previously backfilled at 0) plus any genuinely new issuance since the last run.`
+          : 'Policies with a policy number (is_issued) not previously seen in the registry — credited at 100% of points regardless of advance-transaction status, per Brilynn 9/12/26.',
     },
     pending_40pct: {
       bucket: pendingBucket, total_credit: pendingTotal,
@@ -568,7 +598,7 @@ async function fetchNetPointsCurrent(page) {
       await setScope(bscPage, values);
       const records = await fetchProductionRecords(bscPage, todayStr);
       console.log(`  Records fetched: ${records.length}`);
-      report.scopes[label] = buildScopeReport(records, label, registry, isBackfillRun);
+      report.scopes[label] = buildScopeReport(records, label, registry, isBackfillRun, UNSEED_DATES);
     }
 
     // --- Running Total = Current WFG (Net) Points + BSCpro Delta ---
